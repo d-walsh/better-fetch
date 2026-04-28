@@ -10,6 +10,188 @@ import * as cheerio from 'cheerio';
 import fetch from 'node-fetch';
 import { URL } from 'url';
 import TurndownService from 'turndown';
+import path from 'path';
+import fs from 'fs';
+import os from 'os';
+
+// ---------------------------------------------------------------------------
+// Structured logging — every crash / timeout gets a forensic trail
+// ---------------------------------------------------------------------------
+
+const LOG_DIR = path.join(os.homedir(), '.cache', 'better-fetch');
+const LOG_PATH = path.join(LOG_DIR, 'server.log');
+
+try {
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+} catch {
+  // ignore — if we can't create the dir, logging will silently fail
+}
+
+function logLine(level: string, msg: string): void {
+  const ts = new Date().toISOString();
+  const line = `${ts} [${level}] ${msg}\n`;
+  try {
+    fs.appendFileSync(LOG_PATH, line);
+  } catch {
+    // never crash on logging failure
+  }
+}
+
+function logInfo(msg: string): void  { logLine('INFO',  msg); }
+function logWarn(msg: string): void  { logLine('WARN',  msg); }
+function logError(msg: string): void { logLine('ERROR', msg); }
+function logCrit(msg: string): void  { logLine('CRIT',  msg); }
+
+// ---------------------------------------------------------------------------
+// Server-level diagnostics (updated by safeCallTool)
+// ---------------------------------------------------------------------------
+
+const serverStartTime: number = Date.now();
+let toolCallCount: number = 0;
+let lastErrorTs: number | null = null;
+let lastErrorMsg: string = 'none';
+
+// ---------------------------------------------------------------------------
+// Timeout constants (ms) — web fetching is inherently slow
+// ---------------------------------------------------------------------------
+
+const TIMEOUTS: Record<string, number> = {
+  fetch_website_single:  60_000,   // single-page fetch
+  fetch_website_nested: 180_000,   // multi-page crawl
+  better_fetch_health_self: 5_000, // health check
+};
+
+function getTimeout(toolName: string): number {
+  return TIMEOUTS[toolName] ?? 60_000;
+}
+
+// ---------------------------------------------------------------------------
+// safeCallTool — never-crash wrapper for the entire tool dispatch
+// ---------------------------------------------------------------------------
+
+async function safeCallTool(
+  toolName: string,
+  fn: () => Promise<unknown>
+): Promise<{ content: Array<{ type: string; text: string }> }> {
+  toolCallCount += 1;
+  const callN = toolCallCount;
+  const timeoutMs = getTimeout(toolName);
+
+  logInfo(`CALL #${callN} ${toolName}`);
+  const t0 = Date.now();
+
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  try {
+    const result = await Promise.race([
+      fn(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`__TIMEOUT__:${timeoutMs}`)),
+          timeoutMs
+        );
+      }),
+    ]);
+    if (timer !== null) clearTimeout(timer);
+
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    logInfo(`OK   #${callN} ${toolName} (${elapsed}s)`);
+
+    if (
+      result !== null &&
+      typeof result === 'object' &&
+      'content' in (result as object)
+    ) {
+      return result as { content: Array<{ type: string; text: string }> };
+    }
+    return {
+      content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+    };
+  } catch (err: unknown) {
+    if (timer !== null) clearTimeout(timer);
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    lastErrorTs = Date.now();
+
+    const isTimeout =
+      err instanceof Error && err.message.startsWith('__TIMEOUT__:');
+
+    if (isTimeout) {
+      const timeoutS = (timeoutMs / 1000).toFixed(0);
+      lastErrorMsg = `timeout after ${elapsed}s`;
+      logWarn(`TIMEOUT #${callN} ${toolName} after ${elapsed}s (limit ${timeoutS}s)`);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              error: 'timeout',
+              tool: toolName,
+              timeout_s: Number(timeoutS),
+              message: `${toolName} did not complete within ${timeoutS}s. Check log: ${LOG_PATH}`,
+            }),
+          },
+        ],
+      };
+    }
+
+    // Everything else — log + return structured error (never crash)
+    const errMsg = err instanceof Error ? err.message : String(err);
+    const stack  = err instanceof Error ? (err.stack ?? '') : '';
+    lastErrorMsg = errMsg;
+    logError(`CRASH #${callN} ${toolName} after ${elapsed}s: ${errMsg}\n${stack}`);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            error: 'exception',
+            tool: toolName,
+            type: err instanceof Error ? err.constructor.name : typeof err,
+            message: errMsg,
+          }),
+        },
+      ],
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Uncaught-exception hooks — forensic logging before process dies
+// ---------------------------------------------------------------------------
+
+process.on('uncaughtException', (err: Error) => {
+  logCrit(`UNCAUGHT EXCEPTION: ${err.name}: ${err.message}\n${err.stack ?? ''}`);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason: unknown) => {
+  const msg =
+    reason instanceof Error
+      ? `${reason.name}: ${reason.message}\n${reason.stack ?? ''}`
+      : String(reason);
+  logCrit(`UNHANDLED REJECTION: ${msg}`);
+});
+
+// ---------------------------------------------------------------------------
+// Heartbeat — logs "alive" every 60s
+// ---------------------------------------------------------------------------
+
+setInterval(() => {
+  const uptimeSec = Math.round((Date.now() - serverStartTime) / 1000);
+  const lastErrStr = lastErrorTs
+    ? `${Math.round((Date.now() - lastErrorTs) / 1000)}s ago`
+    : 'none';
+  logInfo(
+    `HEARTBEAT uptime=${uptimeSec}s calls=${toolCallCount} last_error=${lastErrStr}`
+  );
+}, 60_000).unref();
+
+logInfo(`SERVER START better-fetch v1.0.1`);
+
+// ---------------------------------------------------------------------------
+// Web scraper implementation (unchanged)
+// ---------------------------------------------------------------------------
 
 interface FetchOptions {
   maxDepth?: number;
@@ -77,7 +259,7 @@ class AdvancedWebScraper {
 
   private extractLinks($: cheerio.CheerioAPI, baseUrl: string): string[] {
     const links: string[] = [];
-    
+
     $('a[href]').each((_, element) => {
       const href = $(element).attr('href');
       if (href) {
@@ -143,10 +325,10 @@ class AdvancedWebScraper {
   private cleanContent($: cheerio.CheerioAPI): string {
     // Remove unwanted elements
     $('script, style, nav, header, footer, aside, .advertisement, .ads, .sidebar, .menu, .navigation').remove();
-    
+
     // Find main content area
     let contentElement = $('main, article, .content, .main-content, #content, #main').first();
-    
+
     if (contentElement.length === 0) {
       // Fallback to body if no main content area found
       contentElement = $('body');
@@ -158,9 +340,9 @@ class AdvancedWebScraper {
   private generateSectionTitle(url: string, title: string, depth: number): string {
     const urlObj = new URL(url);
     const pathParts = urlObj.pathname.split('/').filter(part => part && part !== 'index.html');
-    
+
     let sectionTitle = title || pathParts[pathParts.length - 1] || urlObj.hostname;
-    
+
     // Clean up title
     sectionTitle = sectionTitle
       .replace(/[-_]/g, ' ')
@@ -179,12 +361,12 @@ class AdvancedWebScraper {
     this.visitedUrls.add(url);
 
     try {
-      console.error(`Fetching: ${url} (depth: ${depth})`);
-      
+      logInfo(`Fetching: ${url} (depth: ${depth})`);
+
       const response = await this.fetchWithTimeout(url, options.timeout);
-      
+
       if (!response.ok) {
-        console.error(`Failed to fetch ${url}: ${response.status}`);
+        logWarn(`Failed to fetch ${url}: ${response.status}`);
         return null;
       }
 
@@ -192,8 +374,8 @@ class AdvancedWebScraper {
       const $ = cheerio.load(html);
 
       // Extract title
-      const title = $('title').text().trim() || 
-                   $('h1').first().text().trim() || 
+      const title = $('title').text().trim() ||
+                   $('h1').first().text().trim() ||
                    'Untitled Page';
 
       // Clean and extract content
@@ -212,7 +394,7 @@ class AdvancedWebScraper {
       };
 
     } catch (error) {
-      console.error(`Error fetching ${url}:`, error);
+      logError(`Error fetching ${url}: ${error}`);
       return null;
     }
   }
@@ -239,7 +421,7 @@ class AdvancedWebScraper {
       }
 
       const pageContent = await this.fetchPageContent(url, depth, options);
-      
+
       if (pageContent) {
         allContent.push(pageContent);
 
@@ -263,14 +445,14 @@ class AdvancedWebScraper {
   private formatAsMarkdown(contents: PageContent[], startUrl: string): string {
     const urlObj = new URL(startUrl);
     const siteName = urlObj.hostname;
-    
+
     let markdown = `# ${siteName} Documentation\n\n`;
     markdown += `*Scraped from: ${startUrl}*\n`;
     markdown += `*Generated on: ${new Date().toISOString()}*\n\n`;
-    
+
     // Table of contents
     markdown += `## Table of Contents\n\n`;
-    contents.forEach((content, index) => {
+    contents.forEach((content, _index) => {
       const indent = '  '.repeat(content.depth);
       markdown += `${indent}- [${content.title}](#${this.slugify(content.title)})\n`;
     });
@@ -297,7 +479,10 @@ class AdvancedWebScraper {
   }
 }
 
-// Define the tools
+// ---------------------------------------------------------------------------
+// Tool definitions (signatures and descriptions unchanged)
+// ---------------------------------------------------------------------------
+
 const TOOLS: Tool[] = [
   {
     name: "fetch_website_nested",
@@ -315,7 +500,7 @@ const TOOLS: Tool[] = [
           default: 2,
         },
         maxPages: {
-          type: "number", 
+          type: "number",
           description: "Maximum number of pages to fetch (default: 50)",
           default: 50,
         },
@@ -330,7 +515,7 @@ const TOOLS: Tool[] = [
           description: "Regex patterns for URLs to exclude",
         },
         includePatterns: {
-          type: "array", 
+          type: "array",
           items: { type: "string" },
           description: "Regex patterns for URLs to include (if specified, only matching URLs will be processed)",
         },
@@ -362,13 +547,25 @@ const TOOLS: Tool[] = [
       required: ["url"],
     },
   },
+  {
+    name: "better_fetch_health_self",
+    description: "Health check for the better-fetch MCP server. Returns uptime, log path, last error, and total tool call count.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
 ];
 
-// Create the server
+// ---------------------------------------------------------------------------
+// MCP Server
+// ---------------------------------------------------------------------------
+
 const server = new Server(
   {
     name: "better-fetch",
-    version: "1.0.0",
+    version: "1.0.1",
   },
   {
     capabilities: {
@@ -381,32 +578,30 @@ const scraper = new AdvancedWebScraper();
 
 // Handle tool listing
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: TOOLS,
-  };
+  return { tools: TOOLS };
 });
 
-// Handle tool execution
+// Handle tool execution — all calls go through safeCallTool
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
-  switch (name) {
-    case "fetch_website_nested": {
-      const {
-        url,
-        maxDepth = 2,
-        maxPages = 50,
-        sameDomainOnly = true,
-        excludePatterns = [],
-        includePatterns = [],
-        timeout = 10000,
-      } = args as any;
+  return safeCallTool(name, async () => {
+    switch (name) {
+      case "fetch_website_nested": {
+        const {
+          url,
+          maxDepth = 2,
+          maxPages = 50,
+          sameDomainOnly = true,
+          excludePatterns = [],
+          includePatterns = [],
+          timeout = 10000,
+        } = args as any;
 
-      if (!url) {
-        throw new Error("URL is required");
-      }
+        if (!url) {
+          throw new Error("URL is required");
+        }
 
-      try {
         const options: FetchOptions = {
           maxDepth,
           maxPages,
@@ -417,28 +612,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         const markdown = await scraper.scrapeWebsite(url, options);
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: markdown,
-            },
-          ],
-        };
-      } catch (error) {
-        throw new Error(`Failed to fetch website: ${error}`);
-      }
-    }
-
-    case "fetch_website_single": {
-      const { url, timeout = 10000 } = args as any;
-
-      if (!url) {
-        throw new Error("URL is required");
+        return { content: [{ type: "text", text: markdown }] };
       }
 
-      try {
+      case "fetch_website_single": {
+        const { url, timeout = 10000 } = args as any;
+
+        if (!url) {
+          throw new Error("URL is required");
+        }
+
         const options: FetchOptions = {
           maxDepth: 0,
           maxPages: 1,
@@ -446,31 +629,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         const markdown = await scraper.scrapeWebsite(url, options);
+        return { content: [{ type: "text", text: markdown }] };
+      }
+
+      case "better_fetch_health_self": {
+        const uptimeSec = Math.round((Date.now() - serverStartTime) / 1000);
+        const lastErrStr = lastErrorTs
+          ? `${Math.round((Date.now() - lastErrorTs) / 1000)}s ago: ${lastErrorMsg}`
+          : 'none';
 
         return {
           content: [
             {
-              type: "text",
-              text: markdown,
+              type: 'text',
+              text: JSON.stringify({
+                status: 'ok',
+                uptime_s: uptimeSec,
+                total_calls: toolCallCount,
+                last_error: lastErrStr,
+                log_path: LOG_PATH,
+                server: 'better-fetch v1.0.1',
+              }, null, 2),
             },
           ],
         };
-      } catch (error) {
-        throw new Error(`Failed to fetch single page: ${error}`);
       }
-    }
 
-    default:
-      throw new Error(`Unknown tool: ${name}`);
-  }
+      default:
+        throw new Error(`Unknown tool: ${name}`);
+    }
+  });
 });
 
-// Error handling
+// Server-level error handler
 server.onerror = (error) => {
-  console.error("[MCP Error]", error);
+  logError(`[MCP Server Error] ${error}`);
 };
 
 process.on("SIGINT", async () => {
+  logInfo('SIGINT received — shutting down');
   await server.close();
   process.exit(0);
 });
@@ -479,10 +676,10 @@ process.on("SIGINT", async () => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Advanced Web Scraper MCP Server running on stdio");
+  logInfo("better-fetch MCP server running on stdio");
 }
 
 main().catch((error) => {
-  console.error("Server failed to start:", error);
+  logCrit(`Server failed to start: ${error}`);
   process.exit(1);
 });
